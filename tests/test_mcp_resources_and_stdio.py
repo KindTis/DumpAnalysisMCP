@@ -74,6 +74,7 @@ def test_server_lists_resources_for_registered_dump(tmp_path: Path) -> None:
     resources = server.list_resources()
 
     assert f"crash://{dump_id}/summary" in resources
+    assert f"crash://{dump_id}/threads" in resources
     assert f"crash://{dump_id}/source/main-frame" in resources
     assert "project://symbols/status" in resources
 
@@ -116,6 +117,8 @@ async def _run_stdio_handshake_test() -> None:
             tool_names = {tool.name for tool in tools_result.tools}
             assert "register_dump" in tool_names
             assert "analyze_dump" in tool_names
+            assert "get_thread_list" in tool_names
+            assert "get_thread_stack_trace" in tool_names
 
             resources_result = await session.list_resources()
             resource_uris = {str(resource.uri) for resource in resources_result.resources}
@@ -125,6 +128,7 @@ async def _run_stdio_handshake_test() -> None:
             templates_result = await session.list_resource_templates()
             template_uris = {str(template.uriTemplate) for template in templates_result.resourceTemplates}
             assert "crash://{dump_id}/summary" in template_uris
+            assert "crash://{dump_id}/threads" in template_uris
             assert "crash://{dump_id}/source/main-frame" in template_uris
 
 

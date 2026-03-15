@@ -39,6 +39,36 @@ start             end                 module name
 00007ffd`dc2e0000 00007ffd`dc3a9000   kernel32   (export symbols)       kernel32.dll
 """
 
+MULTI_THREAD_OUTPUT = r"""
+DUMP_TYPE: minidump
+PROJECT_TYPE: native_cpp
+EXCEPTION_CODE: (NTSTATUS) 0xc0000005 - EXCEPTION_ACCESS_VIOLATION
+FAULTING_IP:
+CppConsoleApplication!DataProcessor::ConsumeData+0x23 [C:\OldRoot\CppConsoleApplication.cpp @ 95]
+DUMP_MCP_BEGIN_THREAD_LIST
+.  0  Id: 4ea8.654c Suspend: 1 Teb: 00000000`00001000 Unfrozen
+   1  Id: 4ea8.33a0 Suspend: 1 Teb: 00000000`00002000 Unfrozen
+DUMP_MCP_END_THREAD_LIST
+DUMP_MCP_BEGIN_ALL_THREADS_STACK
+.  0  Id: 4ea8.654c Suspend: 1 Teb: 00000000`00001000 Unfrozen
+00000040`0010f910 00007ff7`c22417b0 CppConsoleApplication!DataProcessor::ConsumeData+0x23
+00000040`0010f930 00007ff7`c22439d9 CppConsoleApplication!SubThreadEntry+0x80
+00000040`0010f950 00007ffd`dc311234 kernel32!BaseThreadInitThunk+0x14
+   1  Id: 4ea8.33a0 Suspend: 1 Teb: 00000000`00002000 Unfrozen
+00000040`0011f910 00007ff7`c2241000 CppConsoleApplication!main+0x44
+00000040`0011f930 00007ffd`dc311234 kernel32!BaseThreadInitThunk+0x14
+DUMP_MCP_END_ALL_THREADS_STACK
+DUMP_MCP_BEGIN_RUNAWAY
+ User Mode Time
+ Thread       Time
+   0:654c     0 days 0:00:01.250
+   1:33a0     0 days 0:00:09.125
+DUMP_MCP_END_RUNAWAY
+LOADED_MODULES:
+CppConsoleApplication.exe | good
+SYMBOL_STATUS: good
+"""
+
 
 class StubRunner:
     def __init__(self, output: str, *, fail: bool = False):
@@ -209,3 +239,79 @@ def test_analyze_dump_parses_real_cdb_style_output(tmp_path: Path) -> None:
     assert len(result["stack_frames"]) >= 2
     assert "TriggerAccessViolation" in result["stack_frames"][0]["function"]
     assert result["symbol_quality"] == "good"
+
+
+def test_analyze_dump_parses_multi_thread_sections(tmp_path: Path) -> None:
+    runner = StubRunner(MULTI_THREAD_OUTPUT)
+    config = ServerConfig(cdb_path="C:\\Debuggers\\cdb.exe").validate()
+    server = DumpAnalysisMCPServer(config=config, debugger_runner=runner)
+    dump_id = _make_registered_dump(server, tmp_path)
+
+    result = server.call_tool("analyze_dump", {"dump_id": dump_id})
+
+    assert result["ok"] is True
+    assert result["thread_count"] == 2
+    assert result["crashing_thread"] == 0
+    assert result["fault_function"] == "DataProcessor::ConsumeData"
+    assert any(pattern == "main_alive_worker_crashed" for pattern in result["suspected_patterns"])
+    assert result["threads"][0]["is_faulting"] is True
+    assert result["threads"][1]["thread_id"] == 1
+    assert result["threads"][0]["cpu_user_time_seconds"] == 1.25
+    assert result["threads"][1]["cpu_user_time_seconds"] == 9.125
+    assert result["threads"][0]["cpu_user_time_text"] == "0 days 00:00:01.250"
+    assert result["threads"][1]["cpu_user_time_text"] == "0 days 00:00:09.125"
+
+
+def test_thread_tools_return_selected_thread_frames(tmp_path: Path) -> None:
+    runner = StubRunner(MULTI_THREAD_OUTPUT)
+    config = ServerConfig(cdb_path="C:\\Debuggers\\cdb.exe").validate()
+    server = DumpAnalysisMCPServer(config=config, debugger_runner=runner)
+    dump_id = _make_registered_dump(server, tmp_path)
+    server.call_tool("analyze_dump", {"dump_id": dump_id})
+
+    listed = server.call_tool("get_thread_list", {"dump_id": dump_id})
+    assert listed["ok"] is True
+    assert listed["thread_count"] == 2
+    assert len(listed["threads"]) == 2
+    assert any(item["is_faulting"] for item in listed["threads"])
+    assert listed["threads"][0]["cpu_user_time_seconds"] == 1.25
+
+    selected = server.call_tool(
+        "get_thread_stack_trace",
+        {"dump_id": dump_id, "thread_id": 1, "max_frames": 1},
+    )
+    assert selected["ok"] is True
+    assert selected["thread_id"] == 1
+    assert len(selected["stack_frames"]) == 1
+    assert selected["stack_frames"][0]["function"] == "main"
+    assert selected["cpu_user_time_seconds"] == 9.125
+
+    legacy_selected = server.call_tool(
+        "get_stack_trace",
+        {"dump_id": dump_id, "thread_id": 1, "max_frames": 1},
+    )
+    assert legacy_selected["ok"] is True
+    assert legacy_selected["thread_id"] == 1
+    assert legacy_selected["stack_frames"][0]["function"] == "main"
+
+    os_tid = next(item["os_thread_id"] for item in listed["threads"] if item["thread_id"] == 1)
+    selected_by_os_tid = server.call_tool(
+        "get_thread_stack_trace",
+        {"dump_id": dump_id, "thread_id": os_tid, "max_frames": 1},
+    )
+    assert selected_by_os_tid["ok"] is True
+    assert selected_by_os_tid["thread_id"] == 1
+
+    legacy_by_os_tid = server.call_tool(
+        "get_stack_trace",
+        {"dump_id": dump_id, "thread_id": os_tid, "max_frames": 1},
+    )
+    assert legacy_by_os_tid["ok"] is True
+    assert legacy_by_os_tid["thread_id"] == 1
+
+    invalid_thread = server.call_tool(
+        "get_thread_stack_trace",
+        {"dump_id": dump_id, "thread_id": 999999},
+    )
+    assert invalid_thread["ok"] is False
+    assert invalid_thread["error"]["code"] == "invalid_request"

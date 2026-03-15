@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from .analyzer import DumpAnalyzerCore
@@ -40,6 +41,8 @@ class ToolRegistry:
             "analyze_dump": self._analyze_dump,
             "get_exception_info": self._get_exception_info,
             "get_stack_trace": self._get_stack_trace,
+            "get_thread_list": self._get_thread_list,
+            "get_thread_stack_trace": self._get_thread_stack_trace,
             "get_module_list": self._get_module_list,
             "get_source_context": self._get_source_context,
             "search_code_references": self._search_code_references,
@@ -63,6 +66,7 @@ class ToolRegistry:
                     f"crash://{dump_id}/summary",
                     f"crash://{dump_id}/exception",
                     f"crash://{dump_id}/stack",
+                    f"crash://{dump_id}/threads",
                     f"crash://{dump_id}/modules",
                     f"crash://{dump_id}/warnings",
                     f"crash://{dump_id}/source/main-frame",
@@ -125,6 +129,8 @@ class ToolRegistry:
                     "fault_function": analyzed["fault_function"],
                     "source_location": analyzed["source_location"],
                     "symbol_quality": analyzed["symbol_quality"],
+                    "thread_count": analyzed.get("thread_count", 0),
+                    "crashing_thread": analyzed["crashing_thread"],
                     "warnings": analyzed["warnings"],
                 },
             }
@@ -149,6 +155,11 @@ class ToolRegistry:
                     "crashing_thread": analyzed["crashing_thread"],
                     "stack_frames": analyzed["stack_frames"],
                 },
+            }
+        if view == "threads":
+            return {
+                "uri": uri,
+                "contents": self._thread_list_payload(dump_id=dump_id, analyzed=analyzed),
             }
         if view == "modules":
             return {
@@ -177,6 +188,7 @@ class ToolRegistry:
                 focus_line=int(source_location["line"]),
                 context_before=20,
                 context_after=20,
+                source_path_map=session.source_path_map,
             )
             return {"uri": uri, "contents": payload}
 
@@ -204,6 +216,10 @@ class ToolRegistry:
         binary_root = str(args["binary_root"]) if args.get("binary_root") else None
         dump_type_hint = str(args.get("dump_type_hint", "auto"))
         log_paths = [str(item) for item in args.get("log_paths", [])]
+        source_path_map = self._normalize_source_path_map(
+            args.get("source_path_map"),
+            source_root=source_root,
+        )
 
         if project_type not in {"native_cpp", "unreal_engine"}:
             raise ValidationError(
@@ -227,6 +243,7 @@ class ToolRegistry:
             project_type=project_type,
             dump_type_hint=dump_type_hint,
             log_paths=log_paths,
+            source_path_map=source_path_map,
         )
         return {"ok": True, "dump_id": session.dump_id, "status": "registered"}
 
@@ -274,19 +291,47 @@ class ToolRegistry:
         if max_frames <= 0:
             raise ValidationError("max_frames must be positive.")
 
-        raw_thread_id = args.get("thread_id")
-        if raw_thread_id is None:
-            thread_id = int(analyzed["crashing_thread"])
-        else:
-            try:
-                thread_id = int(raw_thread_id)
-            except (TypeError, ValueError):
-                raise ValidationError("thread_id must be an integer.")
-        frames = analyzed["stack_frames"][:max_frames]
+        thread = self._resolve_thread(analyzed=analyzed, raw_thread_id=args.get("thread_id"))
+        frames = thread["stack_frames"][:max_frames]
         return {
             "ok": True,
             "dump_id": dump_id,
-            "thread_id": thread_id,
+            "thread_id": thread["thread_id"],
+            "os_thread_id": thread.get("os_thread_id"),
+            "cpu_user_time_seconds": thread.get("cpu_user_time_seconds"),
+            "cpu_user_time_text": thread.get("cpu_user_time_text"),
+            "stack_frames": frames,
+        }
+
+    def _get_thread_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        dump_id = self._require_dump_id(args)
+        analyzed = self._get_or_analyze(dump_id)
+        return {"ok": True, **self._thread_list_payload(dump_id=dump_id, analyzed=analyzed)}
+
+    def _get_thread_stack_trace(self, args: dict[str, Any]) -> dict[str, Any]:
+        dump_id = self._require_dump_id(args)
+        analyzed = self._get_or_analyze(dump_id)
+        if "thread_id" not in args or args.get("thread_id") is None:
+            raise ValidationError("get_thread_stack_trace requires 'thread_id'.")
+
+        max_frames_value = args.get("max_frames", 30)
+        try:
+            max_frames = int(max_frames_value)
+        except (TypeError, ValueError):
+            raise ValidationError("max_frames must be an integer.")
+        if max_frames <= 0:
+            raise ValidationError("max_frames must be positive.")
+
+        thread = self._resolve_thread(analyzed=analyzed, raw_thread_id=args.get("thread_id"))
+        frames = thread["stack_frames"][:max_frames]
+        return {
+            "ok": True,
+            "dump_id": dump_id,
+            "thread_id": thread["thread_id"],
+            "os_thread_id": thread.get("os_thread_id"),
+            "is_faulting": bool(thread.get("is_faulting", False)),
+            "cpu_user_time_seconds": thread.get("cpu_user_time_seconds"),
+            "cpu_user_time_text": thread.get("cpu_user_time_text"),
             "stack_frames": frames,
         }
 
@@ -311,7 +356,8 @@ class ToolRegistry:
         if frame_index < 0:
             raise ValidationError("frame_index must be >= 0.")
 
-        frames = analyzed["stack_frames"]
+        thread = self._resolve_thread(analyzed=analyzed, raw_thread_id=args.get("thread_id"))
+        frames = thread["stack_frames"]
         if frame_index >= len(frames):
             raise ValidationError(
                 "frame_index is out of range.",
@@ -334,8 +380,15 @@ class ToolRegistry:
             focus_line=source_line,
             context_before=context_before,
             context_after=context_after,
+            source_path_map=session.source_path_map,
         )
-        return {"ok": True, "dump_id": dump_id, "frame_index": frame_index, **payload}
+        return {
+            "ok": True,
+            "dump_id": dump_id,
+            "thread_id": thread["thread_id"],
+            "frame_index": frame_index,
+            **payload,
+        }
 
     def _search_code_references(self, args: dict[str, Any]) -> dict[str, Any]:
         query = args.get("query")
@@ -462,3 +515,111 @@ class ToolRegistry:
             raise ToolNotImplementedError(tool_name)
 
         return _stub
+
+    def _normalize_source_path_map(
+        self,
+        raw_value: Any,
+        *,
+        source_root: str,
+    ) -> dict[str, str]:
+        if raw_value is None:
+            return {}
+        if not isinstance(raw_value, dict):
+            raise ValidationError("source_path_map must be an object of {from: to}.")
+
+        root = Path(source_root).resolve()
+        normalized: dict[str, str] = {}
+        for src_prefix, dst_prefix in raw_value.items():
+            if not isinstance(src_prefix, str) or not src_prefix.strip():
+                raise ValidationError("source_path_map keys must be non-empty strings.")
+            if not isinstance(dst_prefix, str) or not dst_prefix.strip():
+                raise ValidationError("source_path_map values must be non-empty strings.")
+
+            dst = Path(dst_prefix)
+            if not dst.is_absolute():
+                dst = root / dst
+            dst = dst.resolve()
+            ensure_existing_dir(str(dst), ErrorCode.SOURCE_ROOT_INVALID)
+            try:
+                dst.relative_to(root)
+            except ValueError:
+                raise ValidationError(
+                    "source_path_map destination must be inside source_root.",
+                    {"source_root": str(root), "destination": str(dst)},
+                )
+            normalized[src_prefix.strip()] = str(dst)
+        return normalized
+
+    def _resolve_thread(self, *, analyzed: dict[str, Any], raw_thread_id: Any) -> dict[str, Any]:
+        threads = analyzed.get("threads")
+        if isinstance(threads, list) and threads:
+            if raw_thread_id is None:
+                target_thread_id = int(analyzed.get("crashing_thread", 0))
+            else:
+                try:
+                    target_thread_id = int(raw_thread_id)
+                except (TypeError, ValueError):
+                    raise ValidationError("thread_id must be an integer.")
+
+            for thread in threads:
+                if int(thread.get("thread_id", -1)) == target_thread_id:
+                    return thread
+            for thread in threads:
+                if int(thread.get("os_thread_id", -1)) == target_thread_id:
+                    return thread
+            raise ValidationError(
+                "thread_id is out of range.",
+                {"thread_id": target_thread_id, "thread_count": len(threads)},
+            )
+
+        fallback_thread_id = int(analyzed.get("crashing_thread", 0))
+        if raw_thread_id is not None:
+            try:
+                requested = int(raw_thread_id)
+            except (TypeError, ValueError):
+                raise ValidationError("thread_id must be an integer.")
+            if requested != fallback_thread_id:
+                raise ValidationError(
+                    "thread_id is out of range.",
+                    {"thread_id": requested, "thread_count": 1},
+                )
+        frames = analyzed.get("stack_frames", [])
+        return {
+            "thread_id": fallback_thread_id,
+            "os_thread_id": fallback_thread_id,
+            "is_faulting": True,
+            "cpu_user_time_seconds": None,
+            "cpu_user_time_text": None,
+            "stack_frames": frames,
+            "top_frame": frames[0] if frames else None,
+        }
+
+    def _thread_list_payload(self, *, dump_id: str, analyzed: dict[str, Any]) -> dict[str, Any]:
+        threads = analyzed.get("threads")
+        if not isinstance(threads, list) or not threads:
+            threads = [self._resolve_thread(analyzed=analyzed, raw_thread_id=None)]
+
+        rows: list[dict[str, Any]] = []
+        for thread in threads:
+            rows.append(
+                {
+                    "thread_id": int(thread.get("thread_id", -1)),
+                    "os_thread_id": int(thread.get("os_thread_id", -1)),
+                    "os_thread_id_hex": thread.get("os_thread_id_hex")
+                    or f"0x{int(thread.get('os_thread_id', 0)):X}",
+                    "is_faulting": bool(thread.get("is_faulting", False)),
+                    "state_hint": str(thread.get("state_hint", "unknown")),
+                    "top_frame": thread.get("top_frame"),
+                    "frame_count": len(thread.get("stack_frames", [])),
+                    "cpu_user_time_seconds": thread.get("cpu_user_time_seconds"),
+                    "cpu_user_time_text": thread.get("cpu_user_time_text"),
+                }
+            )
+
+        return {
+            "dump_id": dump_id,
+            "crashing_thread": int(analyzed.get("crashing_thread", 0)),
+            "faulting_thread_confidence": analyzed.get("faulting_thread_confidence", "low"),
+            "thread_count": int(analyzed.get("thread_count", len(rows))),
+            "threads": rows,
+        }

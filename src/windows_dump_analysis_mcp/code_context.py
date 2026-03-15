@@ -34,6 +34,34 @@ def _is_inside_root(path: Path, root: Path) -> bool:
         return False
 
 
+def _windows_norm(value: str) -> str:
+    return value.replace("/", "\\").rstrip("\\").lower()
+
+
+def _apply_source_path_map(source_file: str, source_path_map: dict[str, str]) -> Path | None:
+    if not source_file:
+        return None
+
+    normalized = _windows_norm(source_file)
+    best_from: str | None = None
+    best_to: str | None = None
+    for src_prefix, dst_prefix in source_path_map.items():
+        src_norm = _windows_norm(src_prefix)
+        if not src_norm:
+            continue
+        if normalized == src_norm or normalized.startswith(src_norm + "\\"):
+            if best_from is None or len(src_norm) > len(best_from):
+                best_from = src_norm
+                best_to = dst_prefix
+
+    if best_from is None or best_to is None:
+        return None
+
+    suffix = normalized[len(best_from) :].lstrip("\\")
+    mapped_base = Path(best_to)
+    return mapped_base / suffix if suffix else mapped_base
+
+
 class CodeContextProvider:
     def get_source_context(
         self,
@@ -43,6 +71,7 @@ class CodeContextProvider:
         focus_line: int,
         context_before: int,
         context_after: int,
+        source_path_map: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if context_before < 0 or context_after < 0:
             raise ValidationError("context_before/context_after must be >= 0.")
@@ -57,6 +86,12 @@ class CodeContextProvider:
         file_candidate = Path(source_file)
         target = file_candidate if file_candidate.is_absolute() else (root / file_candidate)
         target = target.resolve()
+
+        # If source path from symbols points outside source_root, try explicit remap.
+        if source_path_map and (not _is_inside_root(target, root) or not target.exists()):
+            remapped = _apply_source_path_map(source_file, source_path_map)
+            if remapped is not None:
+                target = remapped.resolve()
 
         if not _is_inside_root(target, root):
             raise ServerError(
