@@ -31,7 +31,7 @@ def create_mcp_app(server: DumpAnalysisMCPServer | None = None) -> FastMCP:
 
     @app.tool(
         name="register_dump",
-        description="Register a dump analysis session and return a new dump_id.",
+        description="Register a dump session (dump/symbol/source paths, project_type, optional source_path_map) and return dump_id.",
     )
     def register_dump(
         dump_path: str,
@@ -41,6 +41,7 @@ def create_mcp_app(server: DumpAnalysisMCPServer | None = None) -> FastMCP:
         binary_root: str | None = None,
         dump_type_hint: str = "auto",
         log_paths: list[str] | None = None,
+        source_path_map: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         return _call_tool(
             backend,
@@ -53,26 +54,27 @@ def create_mcp_app(server: DumpAnalysisMCPServer | None = None) -> FastMCP:
                 "binary_root": binary_root,
                 "dump_type_hint": dump_type_hint,
                 "log_paths": log_paths or [],
+                "source_path_map": source_path_map or {},
             },
         )
 
     @app.tool(
         name="analyze_dump",
-        description="Run dump analysis for a registered dump_id and return structured crash data.",
+        description="Run analysis for a registered dump_id and return normalized crash data (exception, stack, threads, modules, warnings).",
     )
     def analyze_dump(dump_id: str) -> dict[str, Any]:
         return _call_tool(backend, "analyze_dump", {"dump_id": dump_id})
 
     @app.tool(
         name="get_exception_info",
-        description="Get exception code/name/type and fault address for a dump_id.",
+        description="Get exception summary for a dump_id (code, name, type, fault address).",
     )
     def get_exception_info(dump_id: str) -> dict[str, Any]:
         return _call_tool(backend, "get_exception_info", {"dump_id": dump_id})
 
     @app.tool(
         name="get_stack_trace",
-        description="Get stack frames for a dump_id, with optional frame limit and thread selection.",
+        description="Get stack frames for a selected thread in dump_id (default: crashing thread; thread_id uses WinDbg index first, OS TID fallback).",
     )
     def get_stack_trace(
         dump_id: str,
@@ -92,36 +94,66 @@ def create_mcp_app(server: DumpAnalysisMCPServer | None = None) -> FastMCP:
         )
 
     @app.tool(
+        name="get_thread_list",
+        description="List threads for dump_id with faulting metadata, top frame, and CPU user time.",
+    )
+    def get_thread_list(dump_id: str) -> dict[str, Any]:
+        return _call_tool(backend, "get_thread_list", {"dump_id": dump_id})
+
+    @app.tool(
+        name="get_thread_stack_trace",
+        description="Get stack frames for a specific thread (thread_id required; WinDbg index first, OS TID fallback).",
+    )
+    def get_thread_stack_trace(
+        dump_id: str,
+        thread_id: int,
+        max_frames: int = 30,
+    ) -> dict[str, Any]:
+        return _call_tool(
+            backend,
+            "get_thread_stack_trace",
+            {
+                "dump_id": dump_id,
+                "thread_id": thread_id,
+                "max_frames": max_frames,
+            },
+        )
+
+    @app.tool(
         name="get_module_list",
-        description="Get loaded module list and symbol quality for a dump_id.",
+        description="Get loaded modules and overall symbol quality for a dump_id.",
     )
     def get_module_list(dump_id: str) -> dict[str, Any]:
         return _call_tool(backend, "get_module_list", {"dump_id": dump_id})
 
     @app.tool(
         name="get_source_context",
-        description="Get source file context around a selected stack frame for a dump_id.",
+        description="Get source context around a selected frame/thread for dump_id (uses source_path_map remap when provided at register_dump).",
     )
     def get_source_context(
         dump_id: str,
         frame_index: int = 0,
         context_before: int = 20,
         context_after: int = 20,
+        thread_id: int | None = None,
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "dump_id": dump_id,
+            "frame_index": frame_index,
+            "context_before": context_before,
+            "context_after": context_after,
+        }
+        if thread_id is not None:
+            payload["thread_id"] = thread_id
         return _call_tool(
             backend,
             "get_source_context",
-            {
-                "dump_id": dump_id,
-                "frame_index": frame_index,
-                "context_before": context_before,
-                "context_after": context_after,
-            },
+            payload,
         )
 
     @app.tool(
         name="search_code_references",
-        description="Search source references by query within source_root or a dump session.",
+        description="Search code references by query under source_root (explicit) or source_root from dump_id.",
     )
     def search_code_references(
         query: str,
@@ -144,7 +176,7 @@ def create_mcp_app(server: DumpAnalysisMCPServer | None = None) -> FastMCP:
 
     @app.tool(
         name="apply_patch",
-        description="Preview or apply file content changes in source_root with explicit confirmation for apply mode.",
+        description="Preview or apply file changes using dump_id or source_root (apply mode requires user_confirmed=true).",
     )
     def apply_patch(
         changes: list[dict[str, str]],
@@ -167,7 +199,7 @@ def create_mcp_app(server: DumpAnalysisMCPServer | None = None) -> FastMCP:
 
     @app.tool(
         name="build_project",
-        description="Run a guarded build command (allowlist/timeout/confirmation) and return build result.",
+        description="Run a guarded build command (allowlist/timeout; user_confirmed=true required) and return build result.",
     )
     def build_project(
         command: str,
@@ -190,7 +222,7 @@ def create_mcp_app(server: DumpAnalysisMCPServer | None = None) -> FastMCP:
 
     @app.tool(
         name="run_tests",
-        description="Run a guarded test command (allowlist/timeout/confirmation) and return test result.",
+        description="Run a guarded test command (allowlist/timeout; user_confirmed=true required) and return test result.",
     )
     def run_tests(
         command: str,
@@ -234,6 +266,10 @@ def create_mcp_app(server: DumpAnalysisMCPServer | None = None) -> FastMCP:
     @app.resource("crash://{dump_id}/modules")
     def crash_modules(dump_id: str) -> dict[str, Any]:
         return _read_resource(backend, f"crash://{dump_id}/modules")
+
+    @app.resource("crash://{dump_id}/threads")
+    def crash_threads(dump_id: str) -> dict[str, Any]:
+        return _read_resource(backend, f"crash://{dump_id}/threads")
 
     @app.resource("crash://{dump_id}/warnings")
     def crash_warnings(dump_id: str) -> dict[str, Any]:

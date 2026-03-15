@@ -113,6 +113,10 @@ SYMBOL_STATUS: good
     assert analyzed["ok"] is True
     assert analyzed["exception_name"] == "EXCEPTION_ACCESS_VIOLATION"
 
+    threads = server.call_tool("get_thread_list", {"dump_id": dump_id})
+    assert threads["ok"] is True
+    assert threads["thread_count"] >= 1
+
     source_ctx = server.call_tool(
         "get_source_context",
         {"dump_id": dump_id, "frame_index": 0, "context_before": 1, "context_after": 1},

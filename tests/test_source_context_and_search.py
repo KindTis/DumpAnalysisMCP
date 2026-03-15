@@ -22,7 +22,13 @@ class StubRunner:
         return self._output
 
 
-def _register(server: DumpAnalysisMCPServer, tmp_path: Path, source_root: Path) -> str:
+def _register(
+    server: DumpAnalysisMCPServer,
+    tmp_path: Path,
+    source_root: Path,
+    *,
+    source_path_map: dict[str, str] | None = None,
+) -> str:
     dump_file = tmp_path / "sample.dmp"
     dump_file.write_bytes(b"MZ")
     symbol_root = tmp_path / "symbols"
@@ -35,6 +41,7 @@ def _register(server: DumpAnalysisMCPServer, tmp_path: Path, source_root: Path) 
             "symbol_root": str(symbol_root.resolve()),
             "source_root": str(source_root.resolve()),
             "project_type": "native_cpp",
+            "source_path_map": source_path_map or {},
         },
     )
     assert payload["ok"] is True
@@ -115,6 +122,44 @@ SYMBOL_STATUS: good
     result = server.call_tool("get_source_context", {"dump_id": dump_id, "frame_index": 0})
     assert result["ok"] is False
     assert result["error"]["code"] == "invalid_path"
+
+
+def test_get_source_context_applies_source_path_map(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    local_file = source_root / "CppConsoleApplication.cpp"
+    local_file.write_text("\n".join([f"line {idx}" for idx in range(1, 121)]), encoding="utf-8")
+
+    external_source = Path(r"C:\OldRoot\CppConsoleApplication.cpp")
+    output = f"""
+DUMP_TYPE: minidump
+PROJECT_TYPE: native_cpp
+FAULTING_THREAD: 0
+EXCEPTION_CODE: (NTSTATUS) 0xc0000005 - EXCEPTION_ACCESS_VIOLATION
+FAULTING_IP:
+CppConsoleApplication!DataProcessor::ConsumeData+0x23 [{external_source} @ 95]
+STACK_TEXT:
+00000000`0014f2b0 CppConsoleApplication!DataProcessor::ConsumeData+0x23 [{external_source} @ 95]
+LOADED_MODULES:
+CppConsoleApplication.exe | good
+SYMBOL_STATUS: good
+"""
+    server = DumpAnalysisMCPServer(
+        config=ServerConfig(cdb_path="C:\\Debuggers\\cdb.exe").validate(),
+        debugger_runner=StubRunner(output),
+    )
+    dump_id = _register(
+        server,
+        tmp_path,
+        source_root,
+        source_path_map={r"C:\OldRoot": str(source_root.resolve())},
+    )
+    server.call_tool("analyze_dump", {"dump_id": dump_id})
+
+    result = server.call_tool("get_source_context", {"dump_id": dump_id, "frame_index": 0})
+    assert result["ok"] is True
+    assert result["focus_line"] == 95
+    assert result["file"].endswith("CppConsoleApplication.cpp")
 
 
 def test_search_code_references_uses_dump_source_root(tmp_path: Path) -> None:

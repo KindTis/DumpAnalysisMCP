@@ -20,6 +20,7 @@ class DumpSession:
     project_type: str
     dump_type_hint: str
     log_paths: list[str]
+    source_path_map: dict[str, str]
     created_at_utc: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -48,6 +49,7 @@ class DumpSessionStore:
         project_type: str,
         dump_type_hint: str,
         log_paths: list[str],
+        source_path_map: dict[str, str],
     ) -> DumpSession:
         dump_id = self._new_dump_id()
         session = DumpSession(
@@ -59,6 +61,7 @@ class DumpSessionStore:
             project_type=project_type,
             dump_type_hint=dump_type_hint,
             log_paths=log_paths,
+            source_path_map=source_path_map,
             created_at_utc=datetime.now(timezone.utc).isoformat(),
         )
         self._sessions[dump_id] = session
