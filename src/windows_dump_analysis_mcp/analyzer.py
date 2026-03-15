@@ -22,6 +22,8 @@ _EARLY_EXCEPTION_PATTERN = re.compile(
 )
 _THREAD_PATTERN = re.compile(r"FAULTING_THREAD:\s*(\d+)")
 _THREAD_HEX_PATTERN = re.compile(r"FAULTING_THREAD:\s*([0-9a-fA-F]+)", re.IGNORECASE)
+_STACK_COMMAND_THREAD_PATTERN = re.compile(r"STACK_COMMAND:\s*~\s*(\d+)s\b", re.IGNORECASE)
+_LAST_EVENT_TID_PATTERN = re.compile(r"Last event:\s*[0-9a-fA-F]+\.(?P<tid>[0-9a-fA-F]+)\s*:", re.IGNORECASE)
 _FAULT_LINE_PATTERN = re.compile(
     r"(?P<symbol>[^\s\[]+)(?:\s+\[(?P<file>.+?)\s*@\s*(?P<line>\d+)\])?"
 )
@@ -113,6 +115,7 @@ class CdbDebuggerRunner:
                 ".echo DUMP_MCP_BEGIN_RUNAWAY",
                 "!runaway",
                 ".echo DUMP_MCP_END_RUNAWAY",
+                ".lastevent",
                 ".exr -1",
                 "lm",
                 "q",
@@ -185,7 +188,7 @@ def _parse_symbol(raw_symbol: str) -> ParsedSymbol:
     return ParsedSymbol(raw_symbol=symbol, module=module, function=function)
 
 
-def _extract_section(lines: list[str], header: str) -> list[str]:
+def _extract_section(lines: list[str], header: str, *, stop_on_blank: bool = True) -> list[str]:
     target = f"{header}:"
     start_index = -1
     for idx, line in enumerate(lines):
@@ -200,7 +203,7 @@ def _extract_section(lines: list[str], header: str) -> list[str]:
         stripped = line.strip()
         if stripped.endswith(":") and stripped.isupper():
             break
-        if not stripped and collected:
+        if not stripped and collected and stop_on_blank:
             break
         if stripped:
             collected.append(line)
@@ -270,6 +273,23 @@ def _parse_stack_frames_from_lines(lines: list[str]) -> list[dict[str, Any]]:
             )
             continue
 
+        if " : " in stripped:
+            # !analyze -v STACK_TEXT format often stores call site at the last colon-separated segment.
+            call_site = stripped.rsplit(" : ", 1)[-1].strip()
+            if "!" in call_site:
+                parsed = _parse_symbol(call_site)
+                frames.append(
+                    {
+                        "index": len(frames),
+                        "module": parsed.module,
+                        "function": parsed.function,
+                        "file": "",
+                        "line": 0,
+                        "address": "",
+                    }
+                )
+                continue
+
         match = _STACK_LINE_PATTERN.match(stripped)
         if match:
             parsed = _parse_symbol(match.group("symbol"))
@@ -302,7 +322,46 @@ def _parse_stack_frames_from_lines(lines: list[str]) -> list[dict[str, Any]]:
                 }
             )
 
-    return frames
+    return _trim_leading_low_quality_frames(frames)
+
+
+def _is_low_quality_frame(frame: dict[str, Any]) -> bool:
+    module = str(frame.get("module", "")).strip().upper()
+    function = str(frame.get("function", "")).strip().upper()
+    low_quality_tokens = {"WRONG_SYMBOLS", "UNKNOWN", "???"}
+    return module in low_quality_tokens or function in low_quality_tokens
+
+
+def _trim_leading_low_quality_frames(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not frames:
+        return frames
+
+    first_good = 0
+    while first_good < len(frames) and _is_low_quality_frame(frames[first_good]):
+        first_good += 1
+
+    if first_good == 0 or first_good >= len(frames):
+        return frames
+
+    trimmed = [dict(frame) for frame in frames[first_good:]]
+    for idx, frame in enumerate(trimmed):
+        frame["index"] = idx
+    return trimmed
+
+
+def _stack_frames_have_meaningful_symbols(frames: list[dict[str, Any]]) -> bool:
+    return any(not _is_low_quality_frame(frame) for frame in frames)
+
+
+def _choose_preferred_exception_stack(
+    stack_text_frames: list[dict[str, Any]],
+    full_scan_frames: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if stack_text_frames and _stack_frames_have_meaningful_symbols(stack_text_frames):
+        return stack_text_frames
+    if full_scan_frames:
+        return full_scan_frames
+    return stack_text_frames
 
 
 def _parse_thread_headers(lines: list[str]) -> dict[int, dict[str, Any]]:
@@ -405,37 +464,76 @@ def _parse_runaway_times(lines: list[str]) -> dict[int, dict[str, Any]]:
     return parsed
 
 
+def _extract_stack_command_thread(raw_output: str) -> int | None:
+    match = _STACK_COMMAND_THREAD_PATTERN.search(raw_output)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _extract_last_event_tid(raw_output: str) -> int | None:
+    match = _LAST_EVENT_TID_PATTERN.search(raw_output)
+    if not match:
+        return None
+    try:
+        return int(match.group("tid"), 16)
+    except ValueError:
+        return None
+
+
 def _infer_faulting_thread(
     *,
     parsed_threads: list[dict[str, Any]],
-    parsed_faulting_thread: int,
+    parsed_faulting_thread: int | None,
+    stack_command_thread: int | None,
+    last_event_tid: int | None,
     early_exception_tid: int | None,
     fallback_stack_frames: list[dict[str, Any]],
 ) -> tuple[int, str]:
     if not parsed_threads:
-        return parsed_faulting_thread, "low"
+        if stack_command_thread is not None:
+            return stack_command_thread, "low"
+        if parsed_faulting_thread is not None:
+            return parsed_faulting_thread, "low"
+        if early_exception_tid is not None:
+            return early_exception_tid, "low"
+        return 0, "low"
 
     by_index = {item["thread_id"]: item for item in parsed_threads}
-    if early_exception_tid is not None:
-        for item in parsed_threads:
-            if item.get("os_thread_id") == early_exception_tid:
-                return item["thread_id"], "high"
+    by_tid = {int(item.get("os_thread_id", -1)): item for item in parsed_threads}
+    if stack_command_thread is not None and stack_command_thread in by_index:
+        return stack_command_thread, "high"
 
-    if parsed_faulting_thread in by_index:
-        return parsed_faulting_thread, "medium"
+    if last_event_tid is not None and last_event_tid in by_tid:
+        return int(by_tid[last_event_tid]["thread_id"]), "high"
+
+    if early_exception_tid is not None:
+        matched = by_tid.get(early_exception_tid)
+        if matched is not None:
+            return int(matched["thread_id"]), "high"
 
     for item in parsed_threads:
         if item.get("is_current"):
-            return item["thread_id"], "medium"
+            return int(item["thread_id"]), "high"
 
-    fallback_top = fallback_stack_frames[0]["function"] if fallback_stack_frames else ""
+    if parsed_faulting_thread is not None:
+        if parsed_faulting_thread in by_index:
+            return parsed_faulting_thread, "medium"
+        matched = by_tid.get(parsed_faulting_thread)
+        if matched is not None:
+            return int(matched["thread_id"]), "medium"
+
+    fallback_top = str(fallback_stack_frames[0]["function"]) if fallback_stack_frames else ""
     if fallback_top:
         for item in parsed_threads:
             top = item.get("top_frame") or {}
             if top.get("function") == fallback_top:
-                return item["thread_id"], "medium"
+                return int(item["thread_id"]), "medium"
 
-    return parsed_threads[0]["thread_id"], "low"
+    return int(parsed_threads[0]["thread_id"]), "low"
 
 
 def _infer_suspected_patterns(
@@ -504,7 +602,7 @@ def parse_analysis_output(raw_output: str, *, fallback_project_type: str) -> dic
                 exception_name = _exception_name_from_text(early_match.group(3))
                 early_exception_tid = int(early_match.group(2), 16)
 
-    thread_id = 0
+    thread_id: int | None = None
     thread_match = _THREAD_PATTERN.search(raw_output)
     if thread_match:
         thread_id = int(thread_match.group(1))
@@ -514,9 +612,13 @@ def parse_analysis_output(raw_output: str, *, fallback_project_type: str) -> dic
             value = thread_hex_match.group(1).lower()
             if value != "ffffffff":
                 thread_id = int(value, 16)
+            elif early_exception_tid is not None:
+                thread_id = early_exception_tid
         else:
             if early_exception_tid is not None:
                 thread_id = early_exception_tid
+    stack_command_thread = _extract_stack_command_thread(raw_output)
+    last_event_tid = _extract_last_event_tid(raw_output)
 
     fault_address = "unknown"
     fault_address_match = _FAULT_ADDRESS_PATTERN.search(raw_output)
@@ -576,9 +678,10 @@ def parse_analysis_output(raw_output: str, *, fallback_project_type: str) -> dic
             source_line = int(match.group("line"))
         break
 
-    stack_frames = _parse_stack_frames_from_lines(lines)
-    if not stack_frames:
-        stack_frames = _parse_stack_frames_from_lines(_extract_section(lines, "STACK_TEXT"))
+    stack_text_section = _extract_section(lines, "STACK_TEXT", stop_on_blank=False)
+    stack_text_frames = _parse_stack_frames_from_lines(stack_text_section)
+    full_scan_frames = _parse_stack_frames_from_lines(lines)
+    stack_frames = _choose_preferred_exception_stack(stack_text_frames, full_scan_frames)
 
     thread_list_section = _extract_marked_section(lines, _THREAD_LIST_BEGIN, _THREAD_LIST_END)
     all_thread_stack_section = _extract_marked_section(
@@ -601,6 +704,8 @@ def parse_analysis_output(raw_output: str, *, fallback_project_type: str) -> dic
     crashing_thread, faulting_thread_confidence = _infer_faulting_thread(
         parsed_threads=parsed_threads,
         parsed_faulting_thread=thread_id,
+        stack_command_thread=stack_command_thread,
+        last_event_tid=last_event_tid,
         early_exception_tid=early_exception_tid,
         fallback_stack_frames=stack_frames,
     )
@@ -609,9 +714,15 @@ def parse_analysis_output(raw_output: str, *, fallback_project_type: str) -> dic
         for thread in parsed_threads:
             thread["is_faulting"] = thread["thread_id"] == crashing_thread
         selected = next((t for t in parsed_threads if t["thread_id"] == crashing_thread), None)
-        if selected and selected.get("stack_frames"):
+        if selected and selected.get("stack_frames") and not _stack_frames_have_meaningful_symbols(
+            stack_frames
+        ):
             stack_frames = selected["stack_frames"]
-        elif not selected and parsed_threads[0].get("stack_frames"):
+        elif (
+            not selected
+            and parsed_threads[0].get("stack_frames")
+            and not _stack_frames_have_meaningful_symbols(stack_frames)
+        ):
             stack_frames = parsed_threads[0]["stack_frames"]
     else:
         parsed_threads = [

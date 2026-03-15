@@ -69,6 +69,65 @@ CppConsoleApplication.exe | good
 SYMBOL_STATUS: good
 """
 
+FAULTING_THREAD_MAPPING_OUTPUT = r"""
+DUMP_TYPE: minidump
+PROJECT_TYPE: native_cpp
+FAULTING_THREAD: ffffffff
+STACK_COMMAND: ~4s; .ecxr ; kb
+Last event: 3c54.35d4: Access violation - code c0000005 (first/second chance not available)
+EXCEPTION_CODE: (NTSTATUS) 0xc0000005 - EXCEPTION_ACCESS_VIOLATION
+FAULTING_IP:
+CppConsoleApplication!DataProcessor::ConsumeData+0x3b [C:\OldRoot\CppConsoleApplication.cpp @ 95]
+STACK_TEXT:
+0000005c`b2efe9f0 CppConsoleApplication!DataProcessor::ConsumeData+0x3b [C:\OldRoot\CppConsoleApplication.cpp @ 95]
+0000005c`b2efeb10 CppConsoleApplication!DataProcessor::ParseData+0x2c [C:\OldRoot\CppConsoleApplication.cpp @ 82]
+0000005c`b2eff4b0 CppConsoleApplication!SubThreadEntry+0x66 [C:\OldRoot\CppConsoleApplication.cpp @ 155]
+DUMP_MCP_BEGIN_THREAD_LIST
+   0  Id: 3c54.0674 Suspend: 0 Teb: 0000005c`b29f6000 Unfrozen
+.  4  Id: 3c54.35d4 Suspend: 0 Teb: 0000005c`b29fe000 Unfrozen
+DUMP_MCP_END_THREAD_LIST
+DUMP_MCP_BEGIN_ALL_THREADS_STACK
+   0  Id: 3c54.0674 Suspend: 0 Teb: 0000005c`b29f6000 Unfrozen
+0000005c`b2afecf0 ntdll!RtlDelayExecution+0x34
+0000005c`b2afed20 KERNELBASE!SleepEx+0x91
+0000005c`b2afef60 CppConsoleApplication!main+0x3cd
+.  4  Id: 3c54.35d4 Suspend: 0 Teb: 0000005c`b29fe000 Unfrozen
+0000005c`b2efba48 ntdll!NtGetContextThread+0x14
+DUMP_MCP_END_ALL_THREADS_STACK
+LOADED_MODULES:
+CppConsoleApplication.exe | good
+SYMBOL_STATUS: good
+"""
+
+WRONG_SYMBOLS_LEADING_STACK_OUTPUT = r"""
+DUMP_TYPE: minidump
+PROJECT_TYPE: native_cpp
+FAULTING_THREAD: ffffffff
+STACK_COMMAND: ~4s; .ecxr ; kb
+Last event: 3c54.35d4: Access violation - code c0000005 (first/second chance not available)
+EXCEPTION_CODE: (NTSTATUS) 0xc0000005 - EXCEPTION_ACCESS_VIOLATION
+FAULTING_IP:
+CppConsoleApplication!DataProcessor::ConsumeData+0x3b [C:\OldRoot\CppConsoleApplication.cpp @ 95]
+STACK_TEXT:
+0000005c`b2efe9f0 00007ff7`4d1cb6ec : 00000251`079de830 00007ff7`4d1ca7fb 0000005c`b2efecc8 00007ffb`eafcdcd5 : WRONG_SYMBOLS!WRONG_SYMBOLS+0x0
+
+0000005c`b2efeb10 00007ff7`4d1cb69c : 00000251`079de830 00007ffb`00000000 00000000`00000000 0000005c`b2efed28 : CppConsoleApplication!DataProcessor::ConsumeData+0x3b
+0000005c`b2eff4b0 00007ff7`4d1c7a48 : 00000251`079f5580 00007ffc`acf7b350 00000000`00000008 0000005c`b2eff7b8 : CppConsoleApplication!SubThreadEntry+0x66
+DUMP_MCP_BEGIN_THREAD_LIST
+   0  Id: 3c54.0674 Suspend: 0 Teb: 0000005c`b29f6000 Unfrozen
+.  4  Id: 3c54.35d4 Suspend: 0 Teb: 0000005c`b29fe000 Unfrozen
+DUMP_MCP_END_THREAD_LIST
+DUMP_MCP_BEGIN_ALL_THREADS_STACK
+   0  Id: 3c54.0674 Suspend: 0 Teb: 0000005c`b29f6000 Unfrozen
+0000005c`b2afef60 CppConsoleApplication!main+0x3cd
+.  4  Id: 3c54.35d4 Suspend: 0 Teb: 0000005c`b29fe000 Unfrozen
+0000005c`b2efba48 ntdll!NtGetContextThread+0x14
+DUMP_MCP_END_ALL_THREADS_STACK
+LOADED_MODULES:
+CppConsoleApplication.exe | good
+SYMBOL_STATUS: good
+"""
+
 
 class StubRunner:
     def __init__(self, output: str, *, fail: bool = False):
@@ -315,3 +374,36 @@ def test_thread_tools_return_selected_thread_frames(tmp_path: Path) -> None:
     )
     assert invalid_thread["ok"] is False
     assert invalid_thread["error"]["code"] == "invalid_request"
+
+
+def test_faulting_thread_mapping_prefers_deterministic_signals(tmp_path: Path) -> None:
+    runner = StubRunner(FAULTING_THREAD_MAPPING_OUTPUT)
+    config = ServerConfig(cdb_path="C:\\Debuggers\\cdb.exe").validate()
+    server = DumpAnalysisMCPServer(config=config, debugger_runner=runner)
+    dump_id = _make_registered_dump(server, tmp_path)
+
+    analyzed = server.call_tool("analyze_dump", {"dump_id": dump_id})
+    assert analyzed["ok"] is True
+    assert analyzed["faulting_thread_confidence"] == "high"
+    assert analyzed["crashing_thread"] == 4
+    assert analyzed["stack_frames"][0]["function"] == "DataProcessor::ConsumeData"
+
+    listed = server.call_tool("get_thread_list", {"dump_id": dump_id})
+    assert listed["ok"] is True
+    faulting_rows = [item for item in listed["threads"] if item["is_faulting"]]
+    assert len(faulting_rows) == 1
+    assert faulting_rows[0]["thread_id"] == 4
+
+
+def test_stack_text_trims_leading_wrong_symbols_frame(tmp_path: Path) -> None:
+    runner = StubRunner(WRONG_SYMBOLS_LEADING_STACK_OUTPUT)
+    config = ServerConfig(cdb_path="C:\\Debuggers\\cdb.exe").validate()
+    server = DumpAnalysisMCPServer(config=config, debugger_runner=runner)
+    dump_id = _make_registered_dump(server, tmp_path)
+
+    analyzed = server.call_tool("analyze_dump", {"dump_id": dump_id})
+    assert analyzed["ok"] is True
+    assert analyzed["crashing_thread"] == 4
+    assert analyzed["stack_frames"][0]["module"] == "CppConsoleApplication"
+    assert analyzed["stack_frames"][0]["function"] == "DataProcessor::ConsumeData"
+    assert analyzed["stack_frames"][0]["function"] != "WRONG_SYMBOLS"
