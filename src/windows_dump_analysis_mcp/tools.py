@@ -266,11 +266,22 @@ class ToolRegistry:
         dump_id = self._require_dump_id(args)
         analyzed = self._get_or_analyze(dump_id)
 
-        max_frames = int(args.get("max_frames", 30))
+        max_frames_value = args.get("max_frames", 30)
+        try:
+            max_frames = int(max_frames_value)
+        except (TypeError, ValueError):
+            raise ValidationError("max_frames must be an integer.")
         if max_frames <= 0:
             raise ValidationError("max_frames must be positive.")
 
-        thread_id = int(args.get("thread_id", analyzed["crashing_thread"]))
+        raw_thread_id = args.get("thread_id")
+        if raw_thread_id is None:
+            thread_id = int(analyzed["crashing_thread"])
+        else:
+            try:
+                thread_id = int(raw_thread_id)
+            except (TypeError, ValueError):
+                raise ValidationError("thread_id must be an integer.")
         frames = analyzed["stack_frames"][:max_frames]
         return {
             "ok": True,

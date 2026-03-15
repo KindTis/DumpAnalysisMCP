@@ -135,6 +135,37 @@ def test_get_stack_trace_honors_max_frames(tmp_path: Path) -> None:
     assert result["stack_frames"][0]["index"] == 0
 
 
+def test_get_stack_trace_uses_crashing_thread_when_thread_id_is_none(tmp_path: Path) -> None:
+    runner = StubRunner(SAMPLE_DEBUGGER_OUTPUT)
+    config = ServerConfig(cdb_path="C:\\Debuggers\\cdb.exe").validate()
+    server = DumpAnalysisMCPServer(config=config, debugger_runner=runner)
+    dump_id = _make_registered_dump(server, tmp_path)
+    server.call_tool("analyze_dump", {"dump_id": dump_id})
+
+    result = server.call_tool(
+        "get_stack_trace",
+        {"dump_id": dump_id, "thread_id": None, "max_frames": 2},
+    )
+    assert result["ok"] is True
+    assert result["thread_id"] == 42
+    assert len(result["stack_frames"]) == 2
+
+
+def test_get_stack_trace_returns_validation_error_for_invalid_thread_id(tmp_path: Path) -> None:
+    runner = StubRunner(SAMPLE_DEBUGGER_OUTPUT)
+    config = ServerConfig(cdb_path="C:\\Debuggers\\cdb.exe").validate()
+    server = DumpAnalysisMCPServer(config=config, debugger_runner=runner)
+    dump_id = _make_registered_dump(server, tmp_path)
+    server.call_tool("analyze_dump", {"dump_id": dump_id})
+
+    result = server.call_tool(
+        "get_stack_trace",
+        {"dump_id": dump_id, "thread_id": "not-an-int"},
+    )
+    assert result["ok"] is False
+    assert result["error"]["code"] == "invalid_request"
+
+
 def test_get_module_list_returns_modules_and_symbol_quality(tmp_path: Path) -> None:
     runner = StubRunner(SAMPLE_DEBUGGER_OUTPUT)
     config = ServerConfig(cdb_path="C:\\Debuggers\\cdb.exe").validate()

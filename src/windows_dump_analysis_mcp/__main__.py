@@ -79,14 +79,16 @@ def create_mcp_app(server: DumpAnalysisMCPServer | None = None) -> FastMCP:
         max_frames: int = 30,
         thread_id: int | None = None,
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "dump_id": dump_id,
+            "max_frames": max_frames,
+        }
+        if thread_id is not None:
+            payload["thread_id"] = thread_id
         return _call_tool(
             backend,
             "get_stack_trace",
-            {
-                "dump_id": dump_id,
-                "max_frames": max_frames,
-                "thread_id": thread_id,
-            },
+            payload,
         )
 
     @app.tool(
